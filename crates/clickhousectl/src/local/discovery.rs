@@ -203,6 +203,47 @@ fn is_watchdog_command(command: &str) -> bool {
     name.len() >= WATCHDOG_NAME_MIN_LEN && WATCHDOG_PROCESS_NAME.starts_with(name)
 }
 
+/// The process that executes queries for a server `start` recorded.
+///
+/// The recorded PID is the watchdog when ClickHouse has one. The watchdog does
+/// not accept connections; the server it supervises does, and that server is a
+/// child of the watchdog. A PID that is already the server is returned as is.
+pub(crate) fn query_process_pid(supervisor_pid: u32) -> io::Result<u32> {
+    let table = procinfo::process_table()?;
+    Ok(select_query_process(supervisor_pid, &table, |pid| {
+        procinfo::process_args(pid).ok()
+    }))
+}
+
+/// [`query_process_pid`] over an already-read process table.
+fn select_query_process(
+    supervisor_pid: u32,
+    table: &[ProcessEntry],
+    args_of: impl Fn(u32) -> Option<Vec<String>>,
+) -> u32 {
+    let supervisor_command = args_of(supervisor_pid).unwrap_or_default().join(" ");
+    if !is_watchdog_command(&supervisor_command) {
+        return supervisor_pid;
+    }
+    table
+        .iter()
+        .filter(|entry| entry.ppid == supervisor_pid && entry.pid != supervisor_pid)
+        .filter(|entry| is_clickhouse_server(&args_of(entry.pid).unwrap_or_default()))
+        .map(|entry| entry.pid)
+        .next()
+        .unwrap_or(supervisor_pid)
+}
+
+/// Whether arguments belong to the ClickHouse server binary, not the watchdog
+/// and not a client.
+fn is_clickhouse_server(args: &[String]) -> bool {
+    let Some(argv0) = args.first() else {
+        return false;
+    };
+    let name = argv0.rsplit('/').next().unwrap_or(argv0);
+    name == "clickhouse" && args.iter().any(|arg| arg == "server")
+}
+
 /// Resolve, for each of `pids`, the PID to report: its parent when that parent
 /// is a ClickHouse watchdog, otherwise the PID itself.
 ///
@@ -532,6 +573,22 @@ mod tests {
         ] {
             assert_eq!(is_watchdog_command(command), watchdog, "{command:?}");
         }
+    }
+
+    #[test]
+    fn query_debugging_attaches_to_the_server_the_watchdog_supervises() {
+        let table = vec![entry(10, 1, "clickhouse-watc"), entry(11, 10, "clickhouse")];
+        let args = |pid: u32| match pid {
+            10 => Some(vec!["clickhouse-watchdog".to_string()]),
+            11 => Some(vec![
+                "/home/user/.clickhouse/versions/26.11.3.9/clickhouse".to_string(),
+                "server".to_string(),
+            ]),
+            _ => None,
+        };
+        assert_eq!(select_query_process(10, &table, args), 11);
+        assert_eq!(select_query_process(11, &table, args), 11);
+        assert_eq!(select_query_process(10, &[], args), 10);
     }
 
     // ── inspect_process over an already-scanned row ────────────────────

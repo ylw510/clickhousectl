@@ -86,14 +86,14 @@ CONTEXT FOR AGENTS:
     /// Debug a ClickHouse process under lldb
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  --name attaches to a server from `local clickhouse start`. The name is that server's name.
+  --name attaches to a server from `local clickhouse start`. -q runs on that server.
   Without --name, installs the build if needed and opens lldb on `clickhouse local` running the query.
   --break takes a function name or FILE:LINE; repeat it. Omit it to stop where the process is suspended.
   lldb must already be on PATH. FILE:LINE needs debug symbols; a function name uses the symbol table.
   --version accepts latest, stable, lts, a minor such as 25.12, or an exact build; omit for latest.
   On Linux, downloads clickhouse-common-static-dbg for that exact version when the package exists.
   Put clickhouse-local options after `--`. The lldb session owns the terminal.
-  Typical flow: `debug --name dev` or `debug --version stable -q 'SELECT version()'`")]
+  Typical flow: `debug --name dev -q 'SELECT 1'` or `debug --version stable -q 'SELECT version()'`")]
     Debug(DebugArgs),
 
     /// Manage ClickHouse and Postgres in ClickHouse Cloud
@@ -174,14 +174,14 @@ CONTEXT FOR AGENTS:
 pub struct DebugArgs {
     /// Running local ClickHouse server name
     ///
-    /// The server must already be running. Cannot be combined with --version,
-    /// -q, --queries-file, or arguments after `--`.
+    /// The server must already be running. -q and --queries-file run on that
+    /// server. Cannot be combined with --version or arguments after `--`.
     #[arg(
         long = "name",
         short = 'n',
         value_name = "NAME",
         value_parser = parse_debug_server_name,
-        conflicts_with_all = ["version", "query", "queries_file", "args"],
+        conflicts_with_all = ["version", "args"],
         add = crate::local::cli::complete_clickhouse_servers()
     )]
     #[arg(display_order = 0)]
@@ -1099,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_name_selects_a_running_server_and_rejects_a_query() {
+    fn debug_name_selects_a_running_server() {
         let cli = Cli::try_parse_from(["clickhousectl", "debug", "--name", "dev"]).unwrap();
         let Commands::Debug(args) = cli.command else {
             panic!("expected debug command");
@@ -1127,8 +1127,16 @@ mod tests {
             [Breakpoint::Function("DB::executeQuery".to_string())]
         );
 
+        let cli =
+            Cli::try_parse_from(["clickhousectl", "debug", "--name", "dev", "-q", "SELECT 1"])
+                .unwrap();
+        let Commands::Debug(args) = cli.command else {
+            panic!("expected debug command");
+        };
+        assert_eq!(args.name.as_deref(), Some("dev"));
+        assert_eq!(args.query, ["SELECT 1"]);
+
         for argv in [
-            vec!["clickhousectl", "debug", "--name", "dev", "-q", "SELECT 1"],
             vec![
                 "clickhousectl",
                 "debug",

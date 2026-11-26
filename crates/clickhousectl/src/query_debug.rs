@@ -11,6 +11,7 @@
 
 use crate::cli::{Breakpoint, DebugArgs};
 use crate::error::{Error, NetworkCategory, Result};
+use crate::local::discovery;
 use crate::local::server::{self, Engine};
 use crate::paths;
 use crate::version_manager::VersionSpec;
@@ -21,7 +22,7 @@ use crate::version_manager::platform::Platform;
 use flate2::read::GzDecoder;
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tar::Archive;
 
@@ -30,7 +31,7 @@ const REPEATED_QUERY_MIN_VERSION: &str = "23.9.1.1854";
 pub async fn run(args: DebugArgs) -> Result<()> {
     ensure_lldb()?;
     if let Some(name) = args.name {
-        return attach_to_server(&name, &args.breakpoint).await;
+        return attach_to_server(&name, &args.breakpoint, &args.query, &args.queries_file).await;
     }
     let platform = Platform::detect()?;
     let spec = args.version.unwrap_or(VersionSpec::Latest);
@@ -61,7 +62,12 @@ pub async fn run(args: DebugArgs) -> Result<()> {
     exec_lldb(&lldb_arguments(&binary, &args.breakpoint, &local_args))
 }
 
-async fn attach_to_server(name: &str, breakpoints: &[Breakpoint]) -> Result<()> {
+async fn attach_to_server(
+    name: &str,
+    breakpoints: &[Breakpoint],
+    query: &[String],
+    queries_file: &[String],
+) -> Result<()> {
     let metadata_lock = server::lock_recovered_engine_metadata(Some(Engine::Clickhouse))?;
     let missing = || Error::ServerNotFound(name.to_string());
     let metadata_lock = metadata_lock.ok_or_else(missing)?;
@@ -94,19 +100,97 @@ async fn attach_to_server(name: &str, breakpoints: &[Breakpoint]) -> Result<()> 
         }
     }
 
+    // Metadata records the watchdog. Queries run in the server it supervises.
+    let pid = discovery::query_process_pid(info.pid).map_err(Error::Io)?;
+    let query_shell = server_query_shell(name, pid, &info, query, queries_file)?;
     if breakpoints.is_empty() {
-        eprintln!(
-            "Debugging ClickHouse server {name} (pid {}) under lldb; stopped at attach",
-            info.pid
-        );
+        eprintln!("Debugging ClickHouse server {name} (pid {pid}) under lldb; stopped at attach");
     } else {
         eprintln!(
-            "Debugging ClickHouse server {name} (pid {}) under lldb; stopping at {}",
-            info.pid,
+            "Debugging ClickHouse server {name} (pid {pid}) under lldb; stopping at {}",
             describe_breakpoints(breakpoints)
         );
     }
-    exec_lldb(&lldb_attach_arguments(info.pid, breakpoints))
+    if query_shell.is_some() && breakpoints.is_empty() {
+        eprintln!("The query waits until you continue");
+    }
+    exec_lldb(&lldb_attach_arguments(
+        pid,
+        breakpoints,
+        query_shell.as_deref(),
+    ))
+}
+
+fn server_query_shell(
+    name: &str,
+    pid: u32,
+    info: &server::ServerInfo,
+    query: &[String],
+    queries_file: &[String],
+) -> Result<Option<String>> {
+    if query.is_empty() && queries_file.is_empty() {
+        return Ok(None);
+    }
+    ensure_repeated_query_supported(&info.version, query.len())?;
+    if info.tcp_port == 0 {
+        return Err(Error::ServerNotRunning(name.to_string()));
+    }
+    let binary = paths::binary_path(&info.version)?;
+    if !binary.is_file() {
+        return Err(Error::VersionNotFound(info.version.clone()));
+    }
+
+    let directory = std::env::temp_dir();
+    let mut files = Vec::new();
+    if !query.is_empty() {
+        let path = directory.join(format!("clickhousectl-debug-{name}-{pid}.sql"));
+        std::fs::write(&path, query.join("\n")).map_err(Error::Io)?;
+        files.push(path);
+    }
+    files.extend(queries_file.iter().map(PathBuf::from));
+    let output = directory.join(format!("clickhousectl-debug-{name}-{pid}.out"));
+    eprintln!("Query output: {}", output.display());
+    Ok(Some(client_query_shell(
+        &binary,
+        info.tcp_port,
+        &files,
+        &output,
+    )))
+}
+
+/// `platform shell` execs its arguments, so the query command has to go
+/// through `/bin/sh -c` for the redirect and the background `&`.
+fn lldb_platform_shell(script: &str) -> String {
+    let escaped = script.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("platform shell /bin/sh -c \"{escaped}\"")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Shell command that runs the query against the attached server in the
+/// background, so lldb can continue without waiting for the client.
+pub(crate) fn client_query_shell(
+    binary: &Path,
+    port: u16,
+    query_files: &[PathBuf],
+    output: &Path,
+) -> String {
+    let mut command = format!(
+        "{} client --host 127.0.0.1 --port {port}",
+        shell_quote(&binary.display().to_string())
+    );
+    for file in query_files {
+        command.push_str(" --queries-file ");
+        command.push_str(&shell_quote(&file.display().to_string()));
+    }
+    // The client must not inherit lldb's stdin: it would consume the commands
+    // typed at the debugger.
+    command.push_str(" < /dev/null > ");
+    command.push_str(&shell_quote(&output.display().to_string()));
+    command.push_str(" 2>&1 &");
+    command
 }
 
 /// Package channels to try, preferred first. `stable` and anything that is
@@ -167,11 +251,19 @@ fn breakpoint_command(breakpoint: &Breakpoint) -> String {
 
 /// lldb argv for a server that is already running. With no breakpoint, attach
 /// and stay stopped. Otherwise set each breakpoint and continue.
-pub(crate) fn lldb_attach_arguments(pid: u32, breakpoints: &[Breakpoint]) -> Vec<String> {
+pub(crate) fn lldb_attach_arguments(
+    pid: u32,
+    breakpoints: &[Breakpoint],
+    query_shell: Option<&str>,
+) -> Vec<String> {
     let mut args = vec!["-p".to_string(), pid.to_string()];
     for breakpoint in breakpoints {
         args.push("-o".to_string());
         args.push(breakpoint_command(breakpoint));
+    }
+    if let Some(query_shell) = query_shell {
+        args.push("-o".to_string());
+        args.push(lldb_platform_shell(query_shell));
     }
     if !breakpoints.is_empty() {
         args.extend(["-o".to_string(), "continue".to_string()]);
@@ -393,7 +485,7 @@ mod tests {
                 "TSV",
             ]
         );
-        assert_eq!(lldb_attach_arguments(4242, &[]), ["-p", "4242"]);
+        assert_eq!(lldb_attach_arguments(4242, &[], None), ["-p", "4242"]);
         let chosen = [
             Breakpoint::Function("DB::InterpreterSelectQuery::execute".to_string()),
             Breakpoint::FileLine {
@@ -416,7 +508,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            lldb_attach_arguments(4242, &chosen),
+            lldb_attach_arguments(4242, &chosen, None),
             [
                 "-p",
                 "4242",
@@ -428,6 +520,31 @@ mod tests {
                 "continue",
             ]
         );
+        let shell = client_query_shell(
+            &binary,
+            9000,
+            &[PathBuf::from("/tmp/q.sql")],
+            Path::new("/tmp/q.out"),
+        );
+        assert_eq!(
+            lldb_attach_arguments(4242, &chosen, Some(&shell)),
+            vec![
+                "-p".to_string(),
+                "4242".to_string(),
+                "-o".to_string(),
+                "breakpoint set --name \"DB::InterpreterSelectQuery::execute\"".to_string(),
+                "-o".to_string(),
+                "breakpoint set --file \"src/Interpreters/executeQuery.cpp\" --line 410"
+                    .to_string(),
+                "-o".to_string(),
+                lldb_platform_shell(&shell),
+                "-o".to_string(),
+                "continue".to_string(),
+            ]
+        );
+        assert!(shell.contains("client --host 127.0.0.1 --port 9000"));
+        assert!(shell.contains("--queries-file '/tmp/q.sql'"));
+        assert!(shell.ends_with("< /dev/null > '/tmp/q.out' 2>&1 &"));
     }
 
     #[test]

@@ -105,11 +105,14 @@ clickhousectl local client dev --query "SELECT version() FORMAT JSONEachRow"
 ```bash
 clickhousectl debug --version stable -q "SELECT version()"
 clickhousectl debug --name dev
+clickhousectl debug --name dev -q "SELECT 1"
 clickhousectl debug --version stable -q "SELECT version()" --break DB::executeQuery
 clickhousectl debug --version stable -q "SELECT version()" --break src/Interpreters/executeQuery.cpp:410
 ```
 
 Repeat `--break`. A value ending in `:LINE` is a source location. Any other value, including a C++ name such as `DB::executeQuery`, is a function name. A function name uses the binary's symbol table. `FILE:LINE` needs the debug symbol file.
+
+`--name` with `-q` or `--queries-file` runs that SQL on the attached server. The client writes its output to the path printed as `Query output:`. With no `--break`, the server stays stopped and the query waits until you continue.
 
 `--version` accepts `latest`, `stable`, `lts`, a minor such as `25.12`, or an exact build. Omitting it uses `latest`. On Linux, when `clickhouse-common-static-dbg` exists for that exact version, it is unpacked to `clickhouse.debug` beside the binary. lldb associates that file by build id. The published `latest` build often has no such package, so source lines may be missing. Options after `--` go to `clickhouse local`.
 
