@@ -1,7 +1,8 @@
 //! `clickhousectl debug`: run one query under lldb.
 //!
-//! With no `--break`, the process is launched and stopped at entry. Each
-//! `--break` is installed and the process runs until one of them hits.
+//! With no `--break`, a launched process stops at entry and an attached
+//! server stays stopped where lldb attached. Each `--break` is installed and
+//! the process runs until one of them hits.
 //!
 //! The process being debugged is `clickhouse local`, which executes the SQL.
 //! On Linux the matching `clickhouse-common-static-dbg` package is downloaded
@@ -10,6 +11,7 @@
 
 use crate::cli::{Breakpoint, DebugArgs};
 use crate::error::{Error, NetworkCategory, Result};
+use crate::local::server::{self, Engine};
 use crate::paths;
 use crate::version_manager::VersionSpec;
 use crate::version_manager::download;
@@ -27,8 +29,12 @@ const REPEATED_QUERY_MIN_VERSION: &str = "23.9.1.1854";
 
 pub async fn run(args: DebugArgs) -> Result<()> {
     ensure_lldb()?;
+    if let Some(name) = args.name {
+        return attach_to_server(&name, &args.breakpoint).await;
+    }
     let platform = Platform::detect()?;
-    let version = install::ensure_installed_local_first(&args.version, &platform, false).await?;
+    let spec = args.version.unwrap_or(VersionSpec::Latest);
+    let version = install::ensure_installed_local_first(&spec, &platform, false).await?;
     ensure_repeated_query_supported(&version, args.query.len())?;
     let binary = paths::binary_path(&version)?;
     if !binary.is_file() {
@@ -36,7 +42,7 @@ pub async fn run(args: DebugArgs) -> Result<()> {
     }
 
     if let Some(arch) = platform.packages_arch() {
-        ensure_debug_symbols(&args.version, &version, arch, &binary).await?;
+        ensure_debug_symbols(&spec, &version, arch, &binary).await?;
     } else {
         eprintln!(
             "No debug symbol package is published for this platform; lldb uses the binary's own symbols"
@@ -52,7 +58,55 @@ pub async fn run(args: DebugArgs) -> Result<()> {
         );
     }
     let local_args = clickhouse_local_args(&args.query, &args.queries_file, &args.args);
-    exec_lldb(&binary, &args.breakpoint, &local_args)
+    exec_lldb(&lldb_arguments(&binary, &args.breakpoint, &local_args))
+}
+
+async fn attach_to_server(name: &str, breakpoints: &[Breakpoint]) -> Result<()> {
+    let metadata_lock = server::lock_recovered_engine_metadata(Some(Engine::Clickhouse))?;
+    let missing = || Error::ServerNotFound(name.to_string());
+    let metadata_lock = metadata_lock.ok_or_else(missing)?;
+    let entry = server::server_entry_locked(name, &metadata_lock)?.ok_or_else(missing)?;
+    drop(metadata_lock);
+    if !entry.running || entry.info.as_ref().is_none_or(|info| info.pid == 0) {
+        return Err(Error::ServerNotRunning(name.to_string()));
+    }
+    let info = entry
+        .info
+        .ok_or_else(|| Error::ServerNotRunning(name.to_string()))?;
+    if info.engine != Engine::Clickhouse {
+        return Err(Error::ServerNotFound(name.to_string()));
+    }
+
+    let platform = Platform::detect()?;
+    if let (Some(arch), Ok(VersionSpec::Exact(version))) = (
+        platform.packages_arch(),
+        crate::version_manager::parse_version_spec(&info.version),
+    ) {
+        let binary = paths::binary_path(&version)?;
+        if binary.is_file() {
+            ensure_debug_symbols(
+                &VersionSpec::Exact(version.clone()),
+                &version,
+                arch,
+                &binary,
+            )
+            .await?;
+        }
+    }
+
+    if breakpoints.is_empty() {
+        eprintln!(
+            "Debugging ClickHouse server {name} (pid {}) under lldb; stopped at attach",
+            info.pid
+        );
+    } else {
+        eprintln!(
+            "Debugging ClickHouse server {name} (pid {}) under lldb; stopping at {}",
+            info.pid,
+            describe_breakpoints(breakpoints)
+        );
+    }
+    exec_lldb(&lldb_attach_arguments(info.pid, breakpoints))
 }
 
 /// Package channels to try, preferred first. `stable` and anything that is
@@ -109,6 +163,20 @@ fn breakpoint_command(breakpoint: &Breakpoint) -> String {
             format!("breakpoint set --file {} --line {line}", lldb_quote(file))
         }
     }
+}
+
+/// lldb argv for a server that is already running. With no breakpoint, attach
+/// and stay stopped. Otherwise set each breakpoint and continue.
+pub(crate) fn lldb_attach_arguments(pid: u32, breakpoints: &[Breakpoint]) -> Vec<String> {
+    let mut args = vec!["-p".to_string(), pid.to_string()];
+    for breakpoint in breakpoints {
+        args.push("-o".to_string());
+        args.push(breakpoint_command(breakpoint));
+    }
+    if !breakpoints.is_empty() {
+        args.extend(["-o".to_string(), "continue".to_string()]);
+    }
+    args
 }
 
 /// lldb argv. With no breakpoint, launch and stop at process entry. Otherwise
@@ -264,9 +332,9 @@ fn ensure_lldb() -> Result<()> {
     }
 }
 
-fn exec_lldb(binary: &Path, breakpoints: &[Breakpoint], local_args: &[String]) -> Result<()> {
+fn exec_lldb(arguments: &[String]) -> Result<()> {
     let mut cmd = Command::new("lldb");
-    cmd.args(lldb_arguments(binary, breakpoints, local_args));
+    cmd.args(arguments);
     #[cfg(feature = "telemetry")]
     crate::telemetry::finalize_before_exec();
     #[cfg(feature = "debug-log")]
@@ -325,6 +393,7 @@ mod tests {
                 "TSV",
             ]
         );
+        assert_eq!(lldb_attach_arguments(4242, &[]), ["-p", "4242"]);
         let chosen = [
             Breakpoint::Function("DB::InterpreterSelectQuery::execute".to_string()),
             Breakpoint::FileLine {
@@ -344,6 +413,19 @@ mod tests {
                 "--",
                 "/home/user/.clickhouse/versions/26.10.11.12/clickhouse",
                 "local",
+            ]
+        );
+        assert_eq!(
+            lldb_attach_arguments(4242, &chosen),
+            [
+                "-p",
+                "4242",
+                "-o",
+                "breakpoint set --name \"DB::InterpreterSelectQuery::execute\"",
+                "-o",
+                "breakpoint set --file \"src/Interpreters/executeQuery.cpp\" --line 410",
+                "-o",
+                "continue",
             ]
         );
     }

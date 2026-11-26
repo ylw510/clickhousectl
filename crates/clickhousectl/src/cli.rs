@@ -83,17 +83,17 @@ CONTEXT FOR AGENTS:
   Postgres flow (needs Docker): `local init` -> `local postgres start` -> `local postgres client -q 'SELECT 1'`")]
     Local(LocalArgs),
 
-    /// Debug a query under lldb
+    /// Debug a ClickHouse process under lldb
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Installs the selected build if needed, then opens lldb on `clickhouse local` running the query.
-  --break takes a function name or FILE:LINE; repeat it. Omit it to stop at process entry.
+  --name attaches to a server from `local clickhouse start`. The name is that server's name.
+  Without --name, installs the build if needed and opens lldb on `clickhouse local` running the query.
+  --break takes a function name or FILE:LINE; repeat it. Omit it to stop where the process is suspended.
   lldb must already be on PATH. FILE:LINE needs debug symbols; a function name uses the symbol table.
   --version accepts latest, stable, lts, a minor such as 25.12, or an exact build; omit for latest.
   On Linux, downloads clickhouse-common-static-dbg for that exact version when the package exists.
-  The symbol file is clickhouse.debug beside the binary and must share its build id.
   Put clickhouse-local options after `--`. The lldb session owns the terminal.
-  Typical flow: `debug --version stable -q 'SELECT version()'`")]
+  Typical flow: `debug --name dev` or `debug --version stable -q 'SELECT version()'`")]
     Debug(DebugArgs),
 
     /// Manage ClickHouse and Postgres in ClickHouse Cloud
@@ -172,10 +172,25 @@ CONTEXT FOR AGENTS:
 
 #[derive(Args, Debug)]
 pub struct DebugArgs {
+    /// Running local ClickHouse server name
+    ///
+    /// The server must already be running. Cannot be combined with --version,
+    /// -q, --queries-file, or arguments after `--`.
+    #[arg(
+        long = "name",
+        short = 'n',
+        value_name = "NAME",
+        value_parser = parse_debug_server_name,
+        conflicts_with_all = ["version", "query", "queries_file", "args"],
+        add = crate::local::cli::complete_clickhouse_servers()
+    )]
+    #[arg(display_order = 0)]
+    pub name: Option<String>,
+
     /// ClickHouse version (latest, stable, lts, 25.12, or exact)
-    #[arg(long, short = 'v', default_value = "latest", value_parser = parse_debug_version)]
+    #[arg(long, short = 'v', value_parser = parse_debug_version)]
     #[arg(display_order = 1)]
-    pub version: crate::version_manager::VersionSpec,
+    pub version: Option<crate::version_manager::VersionSpec>,
 
     /// Execute a SQL query; repeatable (repeats need ClickHouse 23.9.1.1854+)
     #[arg(long, short, conflicts_with = "queries_file")]
@@ -232,6 +247,12 @@ fn parse_breakpoint(input: &str) -> Result<Breakpoint, String> {
         });
     }
     Ok(Breakpoint::Function(input.to_string()))
+}
+
+fn parse_debug_server_name(name: &str) -> Result<String, String> {
+    crate::local::server::validate_server_name(name)
+        .map(|()| name.to_string())
+        .map_err(|error| error.to_string())
 }
 
 fn parse_debug_version(input: &str) -> Result<crate::version_manager::VersionSpec, String> {
@@ -1035,9 +1056,9 @@ mod tests {
         };
         assert_eq!(
             args.version,
-            crate::version_manager::VersionSpec::Channel(
+            Some(crate::version_manager::VersionSpec::Channel(
                 crate::version_manager::list::Channel::Stable
-            )
+            ))
         );
         assert_eq!(args.query, ["SELECT version()"]);
         assert!(args.queries_file.is_empty());
@@ -1048,7 +1069,8 @@ mod tests {
         let Commands::Debug(args) = cli.command else {
             panic!("expected debug command");
         };
-        assert_eq!(args.version, crate::version_manager::VersionSpec::Latest);
+        assert!(args.version.is_none());
+        assert!(args.name.is_none());
         assert!(args.query.is_empty());
     }
 
@@ -1074,6 +1096,68 @@ mod tests {
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
         assert!(error.to_string().contains("--query"), "{error}");
         assert!(error.to_string().contains("--queries-file"), "{error}");
+    }
+
+    #[test]
+    fn debug_name_selects_a_running_server_and_rejects_a_query() {
+        let cli = Cli::try_parse_from(["clickhousectl", "debug", "--name", "dev"]).unwrap();
+        let Commands::Debug(args) = cli.command else {
+            panic!("expected debug command");
+        };
+        assert_eq!(args.name.as_deref(), Some("dev"));
+        assert!(args.version.is_none());
+        assert!(args.query.is_empty());
+        assert!(args.breakpoint.is_empty());
+
+        let cli = Cli::try_parse_from([
+            "clickhousectl",
+            "debug",
+            "-n",
+            "dev",
+            "-b",
+            "DB::executeQuery",
+        ])
+        .unwrap();
+        let Commands::Debug(args) = cli.command else {
+            panic!("expected debug command");
+        };
+        assert_eq!(args.name.as_deref(), Some("dev"));
+        assert_eq!(
+            args.breakpoint,
+            [Breakpoint::Function("DB::executeQuery".to_string())]
+        );
+
+        for argv in [
+            vec!["clickhousectl", "debug", "--name", "dev", "-q", "SELECT 1"],
+            vec![
+                "clickhousectl",
+                "debug",
+                "--name",
+                "dev",
+                "--version",
+                "stable",
+            ],
+            vec![
+                "clickhousectl",
+                "debug",
+                "--name",
+                "dev",
+                "--",
+                "--format",
+                "TSV",
+            ],
+        ] {
+            let error = Cli::try_parse_from(argv).err().expect("conflict");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+            assert!(error.to_string().contains("--name"), "{error}");
+        }
+
+        let error = Cli::try_parse_from(["clickhousectl", "debug", "--name", "../dev"])
+            .err()
+            .expect("invalid name");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(error.to_string().contains("--name"), "{error}");
+        assert!(error.to_string().contains("../dev"), "{error}");
     }
 
     #[test]
