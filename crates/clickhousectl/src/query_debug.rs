@@ -4,10 +4,10 @@
 //! server stays stopped where lldb attached. Each `--break` is installed and
 //! the process runs until one of them hits.
 //!
-//! The process being debugged is `clickhouse local`, which executes the SQL.
+//! Launch debugs `clickhouse local`. `--name` debugs the running server.
 //! On Linux the matching `clickhouse-common-static-dbg` package is downloaded
-//! when it exists and stored as `clickhouse.debug` next to the binary so lldb
-//! can load it through the GNU debug link.
+//! when it exists and stored as `clickhouse.debug` next to the binary. lldb is
+//! told to load that file; the binary has no GNU debug link of its own.
 
 use crate::cli::{Breakpoint, DebugArgs};
 use crate::error::{Error, NetworkCategory, Result};
@@ -59,7 +59,13 @@ pub async fn run(args: DebugArgs) -> Result<()> {
         );
     }
     let local_args = clickhouse_local_args(&args.query, &args.queries_file, &args.args);
-    exec_lldb(&lldb_arguments(&binary, &args.breakpoint, &local_args))
+    let symbols = installed_debug_symbols(&binary);
+    exec_lldb(&lldb_arguments(
+        &binary,
+        symbols.as_deref(),
+        &args.breakpoint,
+        &local_args,
+    ))
 }
 
 async fn attach_to_server(
@@ -102,6 +108,10 @@ async fn attach_to_server(
 
     // Metadata records the watchdog. Queries run in the server it supervises.
     let pid = discovery::query_process_pid(info.pid).map_err(Error::Io)?;
+    let binary = paths::binary_path(&info.version)
+        .ok()
+        .filter(|path| path.is_file());
+    let symbols = binary.as_deref().and_then(installed_debug_symbols);
     let query_shell = server_query_shell(name, pid, &info, query, queries_file)?;
     if breakpoints.is_empty() {
         eprintln!("Debugging ClickHouse server {name} (pid {pid}) under lldb; stopped at attach");
@@ -116,6 +126,7 @@ async fn attach_to_server(
     }
     exec_lldb(&lldb_attach_arguments(
         pid,
+        binary.as_deref().zip(symbols.as_deref()),
         breakpoints,
         query_shell.as_deref(),
     ))
@@ -240,6 +251,31 @@ fn lldb_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// A non-empty `clickhouse.debug` beside `binary`.
+///
+/// An empty file is left behind by a failed extract, so it does not count.
+fn installed_debug_symbols(binary: &Path) -> Option<PathBuf> {
+    let symbol = binary.with_file_name("clickhouse.debug");
+    let usable = symbol.is_file() && symbol.metadata().is_ok_and(|metadata| metadata.len() > 0);
+    usable.then_some(symbol)
+}
+
+fn symbol_add_command(binary: &Path, symbol_file: &Path) -> String {
+    format!(
+        "target symbols add -s {} {}",
+        lldb_quote(&binary.display().to_string()),
+        lldb_quote(&symbol_file.display().to_string())
+    )
+}
+
+fn push_symbol_add(args: &mut Vec<String>, symbols: Option<(&Path, &Path)>) {
+    let Some((binary, symbol_file)) = symbols else {
+        return;
+    };
+    args.push("-o".to_string());
+    args.push(symbol_add_command(binary, symbol_file));
+}
+
 fn breakpoint_command(breakpoint: &Breakpoint) -> String {
     match breakpoint {
         Breakpoint::Function(name) => format!("breakpoint set --name {}", lldb_quote(name)),
@@ -253,10 +289,12 @@ fn breakpoint_command(breakpoint: &Breakpoint) -> String {
 /// and stay stopped. Otherwise set each breakpoint and continue.
 pub(crate) fn lldb_attach_arguments(
     pid: u32,
+    symbols: Option<(&Path, &Path)>,
     breakpoints: &[Breakpoint],
     query_shell: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec!["-p".to_string(), pid.to_string()];
+    push_symbol_add(&mut args, symbols);
     for breakpoint in breakpoints {
         args.push("-o".to_string());
         args.push(breakpoint_command(breakpoint));
@@ -275,10 +313,12 @@ pub(crate) fn lldb_attach_arguments(
 /// set each breakpoint and run.
 pub(crate) fn lldb_arguments(
     binary: &Path,
+    symbol_file: Option<&Path>,
     breakpoints: &[Breakpoint],
     local_args: &[String],
 ) -> Vec<String> {
     let mut args = Vec::new();
+    push_symbol_add(&mut args, symbol_file.map(|symbol| (binary, symbol)));
     if breakpoints.is_empty() {
         args.extend([
             "-o".to_string(),
@@ -472,7 +512,7 @@ mod tests {
             &["--format".to_string(), "TSV".to_string()],
         );
         assert_eq!(
-            lldb_arguments(&binary, &[], &local_args),
+            lldb_arguments(&binary, None, &[], &local_args),
             [
                 "-o",
                 "process launch --stop-at-entry",
@@ -485,7 +525,7 @@ mod tests {
                 "TSV",
             ]
         );
-        assert_eq!(lldb_attach_arguments(4242, &[], None), ["-p", "4242"]);
+        assert_eq!(lldb_attach_arguments(4242, None, &[], None), ["-p", "4242"]);
         let chosen = [
             Breakpoint::Function("DB::InterpreterSelectQuery::execute".to_string()),
             Breakpoint::FileLine {
@@ -493,9 +533,13 @@ mod tests {
                 line: 410,
             },
         ];
+        let symbol_file = PathBuf::from("/tmp/click house.debug");
+        let symbol_command = symbol_add_command(&binary, &symbol_file);
         assert_eq!(
-            lldb_arguments(&binary, &chosen, &[]),
+            lldb_arguments(&binary, Some(&symbol_file), &chosen, &[]),
             [
+                "-o",
+                symbol_command.as_str(),
                 "-o",
                 "breakpoint set --name \"DB::InterpreterSelectQuery::execute\"",
                 "-o",
@@ -508,10 +552,12 @@ mod tests {
             ]
         );
         assert_eq!(
-            lldb_attach_arguments(4242, &chosen, None),
+            lldb_attach_arguments(4242, Some((&binary, &symbol_file)), &chosen, None),
             [
                 "-p",
                 "4242",
+                "-o",
+                symbol_command.as_str(),
                 "-o",
                 "breakpoint set --name \"DB::InterpreterSelectQuery::execute\"",
                 "-o",
@@ -527,7 +573,7 @@ mod tests {
             Path::new("/tmp/q.out"),
         );
         assert_eq!(
-            lldb_attach_arguments(4242, &chosen, Some(&shell)),
+            lldb_attach_arguments(4242, None, &chosen, Some(&shell)),
             vec![
                 "-p".to_string(),
                 "4242".to_string(),
@@ -545,6 +591,23 @@ mod tests {
         assert!(shell.contains("client --host 127.0.0.1 --port 9000"));
         assert!(shell.contains("--queries-file '/tmp/q.sql'"));
         assert!(shell.ends_with("< /dev/null > '/tmp/q.out' 2>&1 &"));
+        assert_eq!(
+            symbol_command,
+            "target symbols add -s \"/home/user/.clickhouse/versions/26.10.11.12/clickhouse\" \"/tmp/click house.debug\""
+        );
+    }
+
+    #[test]
+    fn installed_debug_symbols_ignores_a_missing_or_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let binary = dir.path().join("clickhouse");
+        std::fs::write(&binary, b"bin").expect("binary");
+        assert!(installed_debug_symbols(&binary).is_none());
+        let symbol = dir.path().join("clickhouse.debug");
+        std::fs::write(&symbol, b"").expect("empty symbols");
+        assert!(installed_debug_symbols(&binary).is_none());
+        std::fs::write(&symbol, b"dwarf").expect("symbols");
+        assert_eq!(installed_debug_symbols(&binary).expect("symbols"), symbol);
     }
 
     #[test]

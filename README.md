@@ -105,7 +105,7 @@ clickhousectl debug --version stable -q "SELECT version()" --break DB::executeQu
 clickhousectl debug --version stable -q "SELECT version()" --break src/Interpreters/executeQuery.cpp:410
 ```
 
-`lldb` must be on `PATH`. On Linux the command also downloads `clickhouse-common-static-dbg` for that exact build when the package exists and places `clickhouse.debug` next to the binary. A function name uses the binary's symbol table. `FILE:LINE` needs that debug file. The published `latest` build often has no matching DWARF.
+`lldb` must be on `PATH`. On Linux the command also downloads `clickhouse-common-static-dbg` for that exact build when the package exists, places `clickhouse.debug` next to the binary, and loads that file into lldb. A function name uses the binary's symbol table. `FILE:LINE` needs that debug file. The published `latest` build often has no matching DWARF.
 
 `--name` with `-q` or `--queries-file` runs that SQL on the attached server. The client writes its output to the path printed as `Query output:`. With no `--break`, the server stays stopped and the query waits until you continue.
 
