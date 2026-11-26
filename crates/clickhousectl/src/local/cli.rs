@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 
 // Tab completion reads local state only; see `crate::completions`.
-fn complete_clickhouse_servers() -> ArgValueCandidates {
+pub(crate) fn complete_clickhouse_servers() -> ArgValueCandidates {
     ArgValueCandidates::new(crate::completions::clickhouse_servers)
 }
 

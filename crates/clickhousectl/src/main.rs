@@ -21,6 +21,7 @@ mod http;
 mod init;
 mod local;
 mod paths;
+mod query_debug;
 mod search;
 mod skills;
 #[cfg(feature = "telemetry")]
@@ -482,6 +483,7 @@ fn command_json_flag(cmd: &Commands) -> Option<bool> {
     match cmd {
         Commands::Update(_) | Commands::Completions(_) => None,
         Commands::Local(args) => Some(args.json),
+        Commands::Debug(_) => Some(false),
         Commands::Cloud(args) => Some(args.json),
         Commands::Skills(args) => Some(args.json),
         Commands::Search(args) => Some(args.json),
@@ -513,7 +515,9 @@ fn management_error_json(cmd: &Commands) -> bool {
         Commands::Search(args) => json_output(args.json),
         // Local and Cloud print their own envelopes; `telemetry` and
         // `feedback` keep their text diagnostics deliberately.
-        Commands::Local(_) | Commands::Cloud(_) | Commands::Completions(_) => false,
+        Commands::Local(_) | Commands::Debug(_) | Commands::Cloud(_) | Commands::Completions(_) => {
+            false
+        }
         #[cfg(feature = "telemetry")]
         Commands::Telemetry(_) => false,
         #[cfg(feature = "feedback")]
@@ -561,6 +565,7 @@ fn resolve_json(flag: bool, auto_json_env: Option<&str>, agent_detected: bool) -
 async fn run(cmd: Commands) -> Result<()> {
     match cmd {
         Commands::Local(args) => local::run(args.command, json_output(args.json)).await,
+        Commands::Debug(args) => query_debug::run(args).await,
         Commands::Skills(args) => run_skills(args).await,
         Commands::Search(args) => {
             let json = json_output(args.json);
@@ -1114,6 +1119,10 @@ mod tests {
         );
         assert_eq!(
             command_json_flag(&parse(&["clickhousectl", "local", "list"])),
+            Some(false)
+        );
+        assert_eq!(
+            command_json_flag(&parse(&["clickhousectl", "debug", "-q", "SELECT 1"])),
             Some(false)
         );
         // --json is picked up on both cloud and local (global flag).
