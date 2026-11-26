@@ -5,7 +5,7 @@
 //! when it exists and stored as `clickhouse.debug` next to the binary so lldb
 //! can load it through the GNU debug link.
 
-use crate::cli::DebugArgs;
+use crate::cli::{Breakpoint, DebugArgs};
 use crate::error::{Error, NetworkCategory, Result};
 use crate::paths;
 use crate::version_manager::VersionSpec;
@@ -41,9 +41,13 @@ pub async fn run(args: DebugArgs) -> Result<()> {
         );
     }
 
-    eprintln!("Debugging ClickHouse {version} under lldb; stopping at {QUERY_ENTRY_SYMBOL}");
+    let breakpoints = effective_breakpoints(&args.breakpoint);
+    eprintln!(
+        "Debugging ClickHouse {version} under lldb; stopping at {}",
+        describe_breakpoints(&breakpoints)
+    );
     let local_args = clickhouse_local_args(&args.query, &args.queries_file, &args.args);
-    exec_lldb(&binary, &local_args)
+    exec_lldb(&binary, &breakpoints, &local_args)
 }
 
 /// Package channels to try, preferred first. `stable` and anything that is
@@ -78,17 +82,57 @@ pub(crate) fn clickhouse_local_args(
     args
 }
 
-/// lldb argv: create the target, break on query execution, then run.
-pub(crate) fn lldb_arguments(binary: &Path, local_args: &[String]) -> Vec<String> {
-    let mut args = vec![
-        "-o".to_string(),
-        format!("breakpoint set --name {QUERY_ENTRY_SYMBOL}"),
+/// Breakpoints to install. An empty list keeps the query-entry default.
+pub(crate) fn effective_breakpoints(breakpoints: &[Breakpoint]) -> Vec<Breakpoint> {
+    if breakpoints.is_empty() {
+        vec![Breakpoint::Function(QUERY_ENTRY_SYMBOL.to_string())]
+    } else {
+        breakpoints.to_vec()
+    }
+}
+
+fn describe_breakpoints(breakpoints: &[Breakpoint]) -> String {
+    breakpoints
+        .iter()
+        .map(|breakpoint| match breakpoint {
+            Breakpoint::Function(name) => name.clone(),
+            Breakpoint::FileLine { file, line } => format!("{file}:{line}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn lldb_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn breakpoint_command(breakpoint: &Breakpoint) -> String {
+    match breakpoint {
+        Breakpoint::Function(name) => format!("breakpoint set --name {}", lldb_quote(name)),
+        Breakpoint::FileLine { file, line } => {
+            format!("breakpoint set --file {} --line {line}", lldb_quote(file))
+        }
+    }
+}
+
+/// lldb argv: create the target, set each breakpoint, then run.
+pub(crate) fn lldb_arguments(
+    binary: &Path,
+    breakpoints: &[Breakpoint],
+    local_args: &[String],
+) -> Vec<String> {
+    let mut args = Vec::new();
+    for breakpoint in effective_breakpoints(breakpoints) {
+        args.push("-o".to_string());
+        args.push(breakpoint_command(&breakpoint));
+    }
+    args.extend([
         "-o".to_string(),
         "run".to_string(),
         "--".to_string(),
         binary.display().to_string(),
         "local".to_string(),
-    ];
+    ]);
     args.extend(local_args.iter().cloned());
     args
 }
@@ -217,9 +261,9 @@ fn ensure_lldb() -> Result<()> {
     }
 }
 
-fn exec_lldb(binary: &Path, local_args: &[String]) -> Result<()> {
+fn exec_lldb(binary: &Path, breakpoints: &[Breakpoint], local_args: &[String]) -> Result<()> {
     let mut cmd = Command::new("lldb");
-    cmd.args(lldb_arguments(binary, local_args));
+    cmd.args(lldb_arguments(binary, breakpoints, local_args));
     #[cfg(feature = "telemetry")]
     crate::telemetry::finalize_before_exec();
     #[cfg(feature = "debug-log")]
@@ -265,10 +309,10 @@ mod tests {
             &["--format".to_string(), "TSV".to_string()],
         );
         assert_eq!(
-            lldb_arguments(&binary, &local_args),
+            lldb_arguments(&binary, &[], &local_args),
             [
                 "-o",
-                "breakpoint set --name DB::executeQuery",
+                "breakpoint set --name \"DB::executeQuery\"",
                 "-o",
                 "run",
                 "--",
@@ -278,6 +322,27 @@ mod tests {
                 "SELECT 1",
                 "--format",
                 "TSV",
+            ]
+        );
+        let chosen = [
+            Breakpoint::Function("DB::InterpreterSelectQuery::execute".to_string()),
+            Breakpoint::FileLine {
+                file: "src/Interpreters/executeQuery.cpp".to_string(),
+                line: 410,
+            },
+        ];
+        assert_eq!(
+            lldb_arguments(&binary, &chosen, &[]),
+            [
+                "-o",
+                "breakpoint set --name \"DB::InterpreterSelectQuery::execute\"",
+                "-o",
+                "breakpoint set --file \"src/Interpreters/executeQuery.cpp\" --line 410",
+                "-o",
+                "run",
+                "--",
+                "/home/user/.clickhouse/versions/26.10.11.12/clickhouse",
+                "local",
             ]
         );
     }

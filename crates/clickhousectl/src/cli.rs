@@ -87,7 +87,8 @@ CONTEXT FOR AGENTS:
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   Installs the selected build if needed, then opens lldb on `clickhouse local` running the query.
-  Stops at DB::executeQuery. lldb must already be on PATH.
+  --break takes a function name or FILE:LINE; repeat it. Omit it to stop at DB::executeQuery.
+  lldb must already be on PATH. FILE:LINE needs debug symbols; a function name uses the symbol table.
   --version accepts latest, stable, lts, a minor such as 25.12, or an exact build; omit for latest.
   On Linux, downloads clickhouse-common-static-dbg for that exact version when the package exists.
   The symbol file is clickhouse.debug beside the binary and must share its build id.
@@ -186,10 +187,51 @@ pub struct DebugArgs {
     #[arg(display_order = 3)]
     pub queries_file: Vec<String>,
 
+    /// Function name or FILE:LINE breakpoint; repeatable
+    ///
+    /// A trailing colon and line number selects that source line. Any other
+    /// value is a function name, including C++ names such as DB::executeQuery.
+    /// Omit the flag to stop at DB::executeQuery. FILE:LINE needs debug symbols.
+    #[arg(long = "break", short = 'b', value_name = "BREAKPOINT", value_parser = parse_breakpoint)]
+    #[arg(display_order = 4)]
+    pub breakpoint: Vec<Breakpoint>,
+
     /// Native clickhouse-local arguments (require --)
     #[arg(last = true, allow_hyphen_values = true)]
-    #[arg(display_order = 4)]
+    #[arg(display_order = 5)]
     pub args: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Breakpoint {
+    Function(String),
+    FileLine { file: String, line: u32 },
+}
+
+fn parse_breakpoint(input: &str) -> Result<Breakpoint, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err("breakpoint is empty".to_string());
+    }
+    if let Some((file, line_text)) = input.rsplit_once(':')
+        && !line_text.is_empty()
+        && line_text.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        if file.is_empty() {
+            return Err("breakpoint file is empty".to_string());
+        }
+        let line: u32 = line_text
+            .parse()
+            .map_err(|_| "breakpoint line is too large".to_string())?;
+        if line == 0 {
+            return Err("breakpoint line must be at least 1".to_string());
+        }
+        return Ok(Breakpoint::FileLine {
+            file: file.to_string(),
+            line,
+        });
+    }
+    Ok(Breakpoint::Function(input.to_string()))
 }
 
 fn parse_debug_version(input: &str) -> Result<crate::version_manager::VersionSpec, String> {
@@ -998,6 +1040,7 @@ mod tests {
         );
         assert_eq!(args.query, ["SELECT version()"]);
         assert!(args.queries_file.is_empty());
+        assert!(args.breakpoint.is_empty());
         assert_eq!(args.args, ["--format", "TSV"]);
 
         let cli = Cli::try_parse_from(["clickhousectl", "debug"]).unwrap();
@@ -1030,6 +1073,44 @@ mod tests {
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
         assert!(error.to_string().contains("--query"), "{error}");
         assert!(error.to_string().contains("--queries-file"), "{error}");
+    }
+
+    #[test]
+    fn debug_break_accepts_a_function_name_or_file_line() {
+        let cli = Cli::try_parse_from([
+            "clickhousectl",
+            "debug",
+            "-b",
+            "DB::executeQuery",
+            "--break",
+            "src/Interpreters/executeQuery.cpp:410",
+        ])
+        .unwrap();
+        let Commands::Debug(args) = cli.command else {
+            panic!("expected debug command");
+        };
+        assert_eq!(
+            args.breakpoint,
+            [
+                Breakpoint::Function("DB::executeQuery".to_string()),
+                Breakpoint::FileLine {
+                    file: "src/Interpreters/executeQuery.cpp".to_string(),
+                    line: 410,
+                },
+            ]
+        );
+
+        for spec in ["", "executeQuery.cpp:0", ":12", "file:4294967296"] {
+            let error = Cli::try_parse_from(["clickhousectl", "debug", "--break", spec])
+                .err()
+                .unwrap_or_else(|| panic!("breakpoint `{spec}` must be rejected"));
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{spec}"
+            );
+            assert!(error.to_string().contains("--break"), "{spec}: {error}");
+        }
     }
 
     fn parse_search(argv: &[&str]) -> Result<SearchArgs, clap::Error> {

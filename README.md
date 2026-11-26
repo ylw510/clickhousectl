@@ -95,13 +95,15 @@ clickhousectl local postgres stop dev
 
 Continue with [local development](docs/guides/local-development.md) for SQL files, version selection, configuration, and cleanup.
 
-To step through a query under lldb, stopping at `DB::executeQuery`:
+To step through a query under lldb. With no `--break`, it stops at `DB::executeQuery`. Repeat `--break` with a function name or `FILE:LINE`:
 
 ```bash
 clickhousectl debug --version stable -q "SELECT version()"
+clickhousectl debug --version stable -q "SELECT version()" --break DB::executeQuery
+clickhousectl debug --version stable -q "SELECT version()" --break src/Interpreters/executeQuery.cpp:410
 ```
 
-`lldb` must be on `PATH`. On Linux the command also downloads `clickhouse-common-static-dbg` for that exact build when the package exists and places `clickhouse.debug` next to the binary. The published `latest` build often has no matching DWARF.
+`lldb` must be on `PATH`. On Linux the command also downloads `clickhouse-common-static-dbg` for that exact build when the package exists and places `clickhouse.debug` next to the binary. A function name uses the binary's symbol table. `FILE:LINE` needs that debug file. The published `latest` build often has no matching DWARF.
 
 ## Connect to ClickHouse Cloud
 
