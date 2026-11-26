@@ -95,7 +95,7 @@ clickhousectl local postgres stop dev
 
 Continue with [local development](docs/guides/local-development.md) for SQL files, version selection, configuration, and cleanup.
 
-To step through a query under lldb. With no `--break`, it stops at `DB::executeQuery`. Repeat `--break` with a function name or `FILE:LINE`:
+To step through a query under lldb. With no `--break`, the process stops at entry. Repeat `--break` with a function name or `FILE:LINE`:
 
 ```bash
 clickhousectl debug --version stable -q "SELECT version()"

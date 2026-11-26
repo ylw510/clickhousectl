@@ -100,7 +100,7 @@ clickhousectl local client dev --query "SELECT version() FORMAT JSONEachRow"
 
 ## Debug a query under lldb
 
-`clickhousectl debug` installs the selected build if needed and opens lldb on `clickhouse local`. With no `--break`, it stops at `DB::executeQuery` and runs the query. `lldb` must already be on `PATH`.
+`clickhousectl debug` installs the selected build if needed and opens lldb on `clickhouse local`. With no `--break`, it launches the process and stops at entry. `lldb` must already be on `PATH`.
 
 ```bash
 clickhousectl debug --version stable -q "SELECT version()"

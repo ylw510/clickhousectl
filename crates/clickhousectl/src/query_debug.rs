@@ -1,4 +1,7 @@
-//! `clickhousectl debug`: run one query under lldb and stop at query execution.
+//! `clickhousectl debug`: run one query under lldb.
+//!
+//! With no `--break`, the process is launched and stopped at entry. Each
+//! `--break` is installed and the process runs until one of them hits.
 //!
 //! The process being debugged is `clickhouse local`, which executes the SQL.
 //! On Linux the matching `clickhouse-common-static-dbg` package is downloaded
@@ -21,7 +24,6 @@ use std::process::Command;
 use tar::Archive;
 
 const REPEATED_QUERY_MIN_VERSION: &str = "23.9.1.1854";
-const QUERY_ENTRY_SYMBOL: &str = "DB::executeQuery";
 
 pub async fn run(args: DebugArgs) -> Result<()> {
     ensure_lldb()?;
@@ -41,13 +43,16 @@ pub async fn run(args: DebugArgs) -> Result<()> {
         );
     }
 
-    let breakpoints = effective_breakpoints(&args.breakpoint);
-    eprintln!(
-        "Debugging ClickHouse {version} under lldb; stopping at {}",
-        describe_breakpoints(&breakpoints)
-    );
+    if args.breakpoint.is_empty() {
+        eprintln!("Debugging ClickHouse {version} under lldb; stopped at process entry");
+    } else {
+        eprintln!(
+            "Debugging ClickHouse {version} under lldb; stopping at {}",
+            describe_breakpoints(&args.breakpoint)
+        );
+    }
     let local_args = clickhouse_local_args(&args.query, &args.queries_file, &args.args);
-    exec_lldb(&binary, &breakpoints, &local_args)
+    exec_lldb(&binary, &args.breakpoint, &local_args)
 }
 
 /// Package channels to try, preferred first. `stable` and anything that is
@@ -82,15 +87,6 @@ pub(crate) fn clickhouse_local_args(
     args
 }
 
-/// Breakpoints to install. An empty list keeps the query-entry default.
-pub(crate) fn effective_breakpoints(breakpoints: &[Breakpoint]) -> Vec<Breakpoint> {
-    if breakpoints.is_empty() {
-        vec![Breakpoint::Function(QUERY_ENTRY_SYMBOL.to_string())]
-    } else {
-        breakpoints.to_vec()
-    }
-}
-
 fn describe_breakpoints(breakpoints: &[Breakpoint]) -> String {
     breakpoints
         .iter()
@@ -115,20 +111,27 @@ fn breakpoint_command(breakpoint: &Breakpoint) -> String {
     }
 }
 
-/// lldb argv: create the target, set each breakpoint, then run.
+/// lldb argv. With no breakpoint, launch and stop at process entry. Otherwise
+/// set each breakpoint and run.
 pub(crate) fn lldb_arguments(
     binary: &Path,
     breakpoints: &[Breakpoint],
     local_args: &[String],
 ) -> Vec<String> {
     let mut args = Vec::new();
-    for breakpoint in effective_breakpoints(breakpoints) {
-        args.push("-o".to_string());
-        args.push(breakpoint_command(&breakpoint));
+    if breakpoints.is_empty() {
+        args.extend([
+            "-o".to_string(),
+            "process launch --stop-at-entry".to_string(),
+        ]);
+    } else {
+        for breakpoint in breakpoints {
+            args.push("-o".to_string());
+            args.push(breakpoint_command(breakpoint));
+        }
+        args.extend(["-o".to_string(), "run".to_string()]);
     }
     args.extend([
-        "-o".to_string(),
-        "run".to_string(),
         "--".to_string(),
         binary.display().to_string(),
         "local".to_string(),
@@ -312,9 +315,7 @@ mod tests {
             lldb_arguments(&binary, &[], &local_args),
             [
                 "-o",
-                "breakpoint set --name \"DB::executeQuery\"",
-                "-o",
-                "run",
+                "process launch --stop-at-entry",
                 "--",
                 "/home/user/.clickhouse/versions/26.10.11.12/clickhouse",
                 "local",

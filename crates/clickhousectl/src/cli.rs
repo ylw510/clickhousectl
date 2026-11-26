@@ -87,7 +87,7 @@ CONTEXT FOR AGENTS:
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   Installs the selected build if needed, then opens lldb on `clickhouse local` running the query.
-  --break takes a function name or FILE:LINE; repeat it. Omit it to stop at DB::executeQuery.
+  --break takes a function name or FILE:LINE; repeat it. Omit it to stop at process entry.
   lldb must already be on PATH. FILE:LINE needs debug symbols; a function name uses the symbol table.
   --version accepts latest, stable, lts, a minor such as 25.12, or an exact build; omit for latest.
   On Linux, downloads clickhouse-common-static-dbg for that exact version when the package exists.
@@ -191,7 +191,7 @@ pub struct DebugArgs {
     ///
     /// A trailing colon and line number selects that source line. Any other
     /// value is a function name, including C++ names such as DB::executeQuery.
-    /// Omit the flag to stop at DB::executeQuery. FILE:LINE needs debug symbols.
+    /// Omit the flag to stop at process entry. FILE:LINE needs debug symbols.
     #[arg(long = "break", short = 'b', value_name = "BREAKPOINT", value_parser = parse_breakpoint)]
     #[arg(display_order = 4)]
     pub breakpoint: Vec<Breakpoint>,
@@ -592,6 +592,7 @@ mod tests {
         let root = Cli::command();
         let mut top = vec![
             "local",
+            "debug",
             "cloud",
             "skills",
             "search",
