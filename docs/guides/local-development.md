@@ -98,6 +98,16 @@ Query output and exit status come from the ClickHouse client, including under `-
 clickhousectl local client dev --query "SELECT version() FORMAT JSONEachRow"
 ```
 
+## Debug a query under lldb
+
+`clickhousectl debug` installs the selected build if needed and opens lldb on `clickhouse local`. It sets a breakpoint on `DB::executeQuery` and runs the query. `lldb` must already be on `PATH`.
+
+```bash
+clickhousectl debug --version stable -q "SELECT version()"
+```
+
+`--version` accepts `latest`, `stable`, `lts`, a minor such as `25.12`, or an exact build. Omitting it uses `latest`. On Linux, when `clickhouse-common-static-dbg` exists for that exact version, it is unpacked to `clickhouse.debug` beside the binary. lldb associates that file by build id. The published `latest` build often has no such package, so source lines may be missing. Options after `--` go to `clickhouse local`.
+
 ## Use the native ClickHouse binary
 
 Use `clickhousectl` to manage the binary, then run `clickhouse` directly. Select the rolling master build and put the managed binary on your shell's `PATH`:

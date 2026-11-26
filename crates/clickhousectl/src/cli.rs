@@ -83,6 +83,18 @@ CONTEXT FOR AGENTS:
   Postgres flow (needs Docker): `local init` -> `local postgres start` -> `local postgres client -q 'SELECT 1'`")]
     Local(LocalArgs),
 
+    /// Debug a query under lldb
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Installs the selected build if needed, then opens lldb on `clickhouse local` running the query.
+  Stops at DB::executeQuery. lldb must already be on PATH.
+  --version accepts latest, stable, lts, a minor such as 25.12, or an exact build; omit for latest.
+  On Linux, downloads clickhouse-common-static-dbg for that exact version when the package exists.
+  The symbol file is clickhouse.debug beside the binary and must share its build id.
+  Put clickhouse-local options after `--`. The lldb session owns the terminal.
+  Typical flow: `debug --version stable -q 'SELECT version()'`")]
+    Debug(DebugArgs),
+
     /// Manage ClickHouse and Postgres in ClickHouse Cloud
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
@@ -155,6 +167,40 @@ CONTEXT FOR AGENTS:
   with Cloud credentials, also their kind and org IDs. Never name, email, user ID, key ID or IP.
   Not blocked by `telemetry disable` or DO_NOT_TRACK. Exit 2: invalid message, nothing sent.")]
     Feedback(FeedbackArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DebugArgs {
+    /// ClickHouse version (latest, stable, lts, 25.12, or exact)
+    #[arg(long, short = 'v', default_value = "latest", value_parser = parse_debug_version)]
+    #[arg(display_order = 1)]
+    pub version: crate::version_manager::VersionSpec,
+
+    /// Execute a SQL query; repeatable (repeats need ClickHouse 23.9.1.1854+)
+    #[arg(long, short, conflicts_with = "queries_file")]
+    #[arg(display_order = 2)]
+    pub query: Vec<String>,
+
+    /// Execute queries from SQL files; accepts multiple paths or repeated flags
+    #[arg(long, num_args = 1.., conflicts_with = "query")]
+    #[arg(display_order = 3)]
+    pub queries_file: Vec<String>,
+
+    /// Native clickhouse-local arguments (require --)
+    #[arg(last = true, allow_hyphen_values = true)]
+    #[arg(display_order = 4)]
+    pub args: Vec<String>,
+}
+
+fn parse_debug_version(input: &str) -> Result<crate::version_manager::VersionSpec, String> {
+    let input = input.trim();
+    if input.starts_with("postgres@") || input.starts_with("postgres:") {
+        return Err(
+            "Postgres image selectors are only supported by `local install`; `debug --version` requires a ClickHouse version"
+                .to_string(),
+        );
+    }
+    crate::version_manager::parse_version_spec(input).map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "feedback")]
@@ -925,6 +971,65 @@ mod tests {
         for agent in crate::skills::supported_agent_keys() {
             assert!(message.contains(agent), "missing `{agent}`: {message}");
         }
+    }
+
+    #[test]
+    fn debug_parses_stable_version_query_and_native_args() {
+        let cli = Cli::try_parse_from([
+            "clickhousectl",
+            "debug",
+            "--version",
+            "stable",
+            "-q",
+            "SELECT version()",
+            "--",
+            "--format",
+            "TSV",
+        ])
+        .unwrap();
+        let Commands::Debug(args) = cli.command else {
+            panic!("expected debug command");
+        };
+        assert_eq!(
+            args.version,
+            crate::version_manager::VersionSpec::Channel(
+                crate::version_manager::list::Channel::Stable
+            )
+        );
+        assert_eq!(args.query, ["SELECT version()"]);
+        assert!(args.queries_file.is_empty());
+        assert_eq!(args.args, ["--format", "TSV"]);
+
+        let cli = Cli::try_parse_from(["clickhousectl", "debug"]).unwrap();
+        let Commands::Debug(args) = cli.command else {
+            panic!("expected debug command");
+        };
+        assert_eq!(args.version, crate::version_manager::VersionSpec::Latest);
+        assert!(args.query.is_empty());
+    }
+
+    #[test]
+    fn debug_rejects_postgres_selectors_and_mixed_query_sources() {
+        let error = Cli::try_parse_from(["clickhousectl", "debug", "--version", "postgres@18"])
+            .err()
+            .expect("postgres selector");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(error.to_string().contains("debug --version"), "{error}");
+        assert!(error.to_string().contains("postgres@18"), "{error}");
+
+        let error = Cli::try_parse_from([
+            "clickhousectl",
+            "debug",
+            "-q",
+            "SELECT 1",
+            "--queries-file",
+            "q.sql",
+        ])
+        .err()
+        .expect("mixed sources");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert!(error.to_string().contains("--query"), "{error}");
+        assert!(error.to_string().contains("--queries-file"), "{error}");
     }
 
     fn parse_search(argv: &[&str]) -> Result<SearchArgs, clap::Error> {

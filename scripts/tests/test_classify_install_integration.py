@@ -154,6 +154,7 @@ class InstallIntegrationClassifierTests(unittest.TestCase):
                     "crates/clickhousectl/src/completions.rs",
                     "crates/clickhousectl/src/debug_log.rs",
                     "crates/clickhousectl/src/dotenv.rs",
+                    "crates/clickhousectl/src/query_debug.rs",
                     "crates/clickhousectl/src/failure.rs",
                     "crates/clickhousectl/src/feedback.rs",
                     "crates/clickhousectl/src/local/config.rs",

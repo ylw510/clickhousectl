@@ -66,6 +66,15 @@ pub async fn download_from_source(
     download_url_with_output(&url, dest_path, structured_output, etag).await
 }
 
+/// Download one URL to `dest_path`, showing the install progress bar.
+pub(crate) async fn download_url(
+    url: &str,
+    dest_path: &Path,
+    structured_output: bool,
+) -> Result<DownloadOutcome> {
+    download_url_with_output(url, dest_path, structured_output, None).await
+}
+
 async fn download_url_with_output(
     url: &str,
     dest_path: &Path,
